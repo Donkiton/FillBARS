@@ -242,6 +242,34 @@
             line-height: 1.35;
         }
 
+        .compat-warning {
+            width: 100%;
+            margin-top: 10px;
+            padding: 10px;
+            border: 1px solid #e1c66f;
+            border-left: 4px solid #b98600;
+            border-radius: 4px;
+            background: #fff8e1;
+            color: #604700;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+
+        .compat-warning p {
+            margin: 0 0 8px;
+        }
+
+        .compat-warning button {
+            width: auto;
+            min-height: 34px;
+            padding: 7px 12px;
+            background: #604700;
+        }
+
+        .compat-warning button:hover {
+            background: #493600;
+        }
+
         .status {
             min-height: 30px;
             padding-top: 8px;
@@ -431,6 +459,11 @@
         <button id="settingsToggle" class="header-settings" type="button" title="Настройки и профили" aria-label="Настройки и профили">⚙</button>
     </header>
 
+    <section id="browserCompatWarning" class="compat-warning" role="status" aria-labelledby="browserCompatTitle" hidden>
+        <p id="browserCompatTitle"><strong>Браузер устарел.</strong> Некоторые функции могут работать некорректно. Если возможно, обновите Chrome до версии 112 или новее — в ней больше памяти для черновиков.</p>
+        <button id="dismissBrowserCompatWarning" type="button">Понятно</button>
+    </section>
+
     <div class="warning">
         Перед назначением анализов убедитесь, что в БАРС отображаются все нужные исследования. Финальное сохранение назначений выполните в БАРС.
     </div>
@@ -463,7 +496,7 @@
     <div id="status" class="status"></div>
     <div class="footer">Все данные обрабатываются локально внутри расширения</div>
     <div class="author">🧠 Идея и разработка: <strong>MorozovRV</strong> и <strong>Bitucckyi VA</strong></div>
-    <div class="version">Версия 5.2.6 | Для медицинских информационных систем</div>
+    <div class="version">Версия 5.2.7 | Для медицинских информационных систем</div>
 
     <div id="settingsPanel" class="panel hidden">
         <div class="panel-header">
@@ -658,6 +691,7 @@
         </div>
     </div>
 
+    <script src="browser-compat.js"></script>
     <script src="popup.js"></script>
     <script src="diary-launch.js"></script>
 </body>

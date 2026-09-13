@@ -2,11 +2,26 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs'),path=require('node:path');
 const C=require('../diary-core');
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-function setup({session={},page={},gate}={}){
+function setup({session={},page={},gate,sessionQuota=10*1024*1024,localQuota=10*1024*1024}={}){
     const local={},calls=[],requests=[];let listener;
-    const storage=data=>({get:async keys=>{const names=Array.isArray(keys)?keys:[keys];return Object.fromEntries(names.filter(k=>data[k]!==undefined).map(k=>[k,structuredClone(data[k])]));},set:async entries=>Object.assign(data,structuredClone(entries)),remove:async key=>{delete data[key];}});
+    const storedBytes=(data,keys=null)=>{
+        const names=keys===null?Object.keys(data):(Array.isArray(keys)?keys:[keys]);
+        return names.filter(key=>data[key]!==undefined).reduce((total,key)=>total+Buffer.byteLength(String(key),'utf8')+Buffer.byteLength(JSON.stringify(data[key]),'utf8'),0);
+    };
+    const storage=(data,quota)=>({
+        QUOTA_BYTES:quota,
+        get:async keys=>{const names=Array.isArray(keys)?keys:[keys];return Object.fromEntries(names.filter(k=>data[k]!==undefined).map(k=>[k,structuredClone(data[k])]));},
+        getBytesInUse:async keys=>storedBytes(data,keys),
+        set:async function(entries){
+            const next={...data,...structuredClone(entries)};
+            if(Number.isFinite(this.QUOTA_BYTES)&&storedBytes(next)>this.QUOTA_BYTES)throw new Error('QUOTA_BYTES exceeded');
+            Object.assign(data,structuredClone(entries));
+        },
+        remove:async key=>{for(const name of Array.isArray(key)?key:[key])delete data[name];}
+    });
+    const sessionArea=storage(session,sessionQuota),localArea=storage(local,localQuota);
     const patient={fullName:'Учебный',birth:'01.01.1980',history:'ДЕМО-1',key:'key1'};
-    const chrome={storage:{session:storage(session),local:storage(local)},runtime:{id:'test',getURL:name=>'chrome-extension://test/'+name,onMessage:{addListener:fn=>{listener=fn;}}},tabs:{onRemoved:{addListener(){}}},scripting:{executeScript:async options=>{
+    const chrome={storage:{session:sessionArea,local:localArea},runtime:{id:'test',getURL:name=>'chrome-extension://test/'+name,onMessage:{addListener:fn=>{listener=fn;}}},tabs:{onRemoved:{addListener(){}}},scripting:{executeScript:async options=>{
         if(options.files)return [];
         const request=options.args?.[0]||{action:'probe'};calls.push(request.action);requests.push(structuredClone(request));
         if(request.action==='prepare'&&gate)await gate;
@@ -17,10 +32,18 @@ function setup({session={},page={},gate}={}){
     const context=vm.createContext({chrome,FillBARSCardCore:C,Map,Promise,Date,console});
     vm.runInContext(fs.readFileSync(path.join(__dirname,'../diary-background.js'),'utf8'),context);
     const send=(action,data={},sender={id:'test',url:'chrome-extension://test/diaries.html'})=>new Promise(resolve=>listener({namespace:'fillbars-card-v1',tabId:1,contextId:session['cardSessionV1:'+(data.tabId??1)]?.contextId,action,...data},sender,resolve));
-    return {send,session,calls,requests,patient};
+    return {send,session,local,calls,requests,patient,sessionArea,localArea};
 }
 function validRow(time='08:00'){
     const row=C.createRow({date:'2026-09-01',time});row.diary='Учебный дневник';row.reviewed=true;return row;
+}
+function denseRows(count){
+    return Array.from({length:count},(_,index)=>{
+        const row=validRow(String(index%24).padStart(2,'0')+':00');
+        row.date='2026-09-'+String(1+Math.floor(index/24)).padStart(2,'0');
+        row.diary='Д'.repeat(4000);row.examination='О'.repeat(4000);row.treatment='Л'.repeat(4000);
+        return row;
+    });
 }
 async function finished(app){
     for(let i=0;i<100;i++){const state=app.session['cardSessionV1:1'];if(state?.run&&state.run.status!=='running')return state;await pause(3);}
@@ -78,6 +101,52 @@ test('посторонняя страница не может прислать �
 test('черновик до первого подключения не теряется',async()=>{
     const app=setup();const rows=[validRow()];await app.send('draft',{draft:{rows}});
     const response=await app.send('connect');assert.equal(response.state.draft.rows[0].diary,'Учебный дневник');
+});
+
+test('при квоте Chrome 109 в 1 МиБ большой черновик отклоняется до записи и не теряется прежнее состояние',async()=>{
+    const app=setup({sessionQuota:1024*1024});await app.send('connect');
+    const response=await app.send('draft',{draft:{rows:denseRows(30)}});
+    assert.equal(response.ok,false);assert.equal(response.code,'storage_quota');
+    assert.match(response.error,/Сократите текст или удалите неотправленные строки/);
+    assert.equal(app.session['cardSessionV1:1'].draft,null);
+    assert.equal(app.calls.filter(action=>action==='save').length,0);
+});
+
+test('резерв 1 МиБ блокирует старт до БАРС, а после 10 МиБ безопасный повтор фиксирует все квитанции',async()=>{
+    const rows=denseRows(30);
+    const initial={
+        'cardSessionV1:1':{binding:{tabId:1,frameId:0,documentId:'document-1'},patient:{key:'key1'},draft:{rows},run:null}
+    };
+    const app=setup({session:initial,sessionQuota:1024*1024});
+    const before=structuredClone(app.session['cardSessionV1:1']);
+    const blocked=await app.send('start',{rows});
+    assert.equal(blocked.ok,false);assert.equal(blocked.code,'storage_quota');
+    assert.deepEqual(app.session['cardSessionV1:1'],before);
+    assert.equal(app.calls.length,0,'квоты должно хватать до probe/prepare/save');
+    app.sessionArea.QUOTA_BYTES=10*1024*1024;
+    assert.equal((await app.send('start',{rows})).ok,true);
+    const state=await finished(app);
+    assert.equal(state.run.status,'done');assert.equal(state.run.results.length,rows.length);
+    assert.equal(app.calls.filter(action=>action==='save').length,rows.length);
+    assert.equal((await app.send('start',{rows})).ok,false,'квитанции не позволяют повторно сохранить те же дневники');
+});
+
+test('переполнение локальной библиотеки сообщает о ней отдельно от очереди',async()=>{
+    const variants=Array.from({length:100},(_,index)=>({id:'v'+index,title:'Вариант',diary:'Д'.repeat(4000),examination:'О'.repeat(4000),treatment:'Л'.repeat(4000)}));
+    const library={type:'fillbars-card-templates',version:C.VERSION,profiles:[{id:'p1',name:'Тест',variants}]};
+    const app=setup({localQuota:1024*1024});
+    const response=await app.send('saveLibrary',{library});
+    assert.equal(response.ok,false);assert.equal(response.code,'storage_quota');
+    assert.match(response.error,/Библиотека слишком велика для локального хранилища/);
+    assert.equal(app.local.cardLibraryV1,undefined);
+});
+
+test('технический trace ограничен до записи в session и не съедает резерв очереди',async()=>{
+    const app=setup({page:{prepare:{ok:false,code:'editor_loading',message:'Ещё загружается',trace:[{time:'2026-09-01T08:00:00Z',stage:'Этап '.repeat(1000),details:'Д'.repeat(10000)}]}}});
+    await app.send('connect');await app.send('start',{rows:[validRow()]});
+    const state=await finished(app),entry=state.run.trace[0];
+    assert.equal(state.run.status,'failed');
+    assert(Buffer.byteLength(JSON.stringify(entry),'utf8')<=1024);
 });
 
 test('после отказа до сохранения новая очередь освобождает старую подготовку',async()=>{
@@ -220,4 +289,57 @@ test('интеграция очереди и DOM: потерянное подт�
         assert.deepEqual(fixture.saved.map(record=>record.fields.VISIT_TIME),['18:00','22:00']);
         assert(fixture.saved.every(record=>record.fields.S_DNEVNIK==='Учебный дневник'));
     }finally{dom.window.close();}
+});
+
+
+test('Chrome 109: после слишком большого черновика уменьшенный сохраняется и отправляется один раз', async () => {
+    const app = setup({sessionQuota: 1024 * 1024});
+    await app.send('connect');
+    assert.equal((await app.send('draft', {draft: {rows: denseRows(30)}})).ok, false);
+    const rows = [validRow()];
+    assert.equal((await app.send('draft', {draft: {rows}})).ok, true);
+    assert.equal((await app.send('start', {rows})).ok, true);
+    assert.equal((await finished(app)).run.status, 'done');
+    assert.equal(app.calls.filter(action => action === 'save').length, 1);
+});
+
+test('нативный отказ storage.set по квоте объясняется и оставляет предыдущий черновик для повтора', async () => {
+    const app = setup({sessionQuota: 1024 * 1024});
+    await app.send('connect');
+    const rows = [validRow()];
+    await app.send('draft', {draft: {rows}});
+    const previous = structuredClone(app.session);
+    const originalSet = app.sessionArea.set;
+    app.sessionArea.set = async () => { throw new Error('QUOTA_BYTES quota exceeded'); };
+    const changed = structuredClone(rows); changed[0].diary = 'Исправленный текст';
+    const rejected = await app.send('draft', {draft: {rows: changed}});
+    assert.equal(rejected.code, 'storage_quota');
+    assert.match(rejected.error, /Сократите текст/);
+    assert.deepEqual(app.session, previous);
+    app.sessionArea.set = originalSet;
+    assert.equal((await app.send('draft', {draft: {rows: changed}})).ok, true);
+    assert.equal(app.session['cardSessionV1:1'].draft.rows[0].diary, 'Исправленный текст');
+});
+
+test('отказ хранилища после сохранения в БАРС восстанавливает неопределённость и блокирует повтор', async () => {
+    let signalSaved;
+    const didSave = new Promise(resolve => { signalSaved = resolve; });
+    const app = setup({sessionQuota: 1024 * 1024, page: {save: () => {
+        app.sessionArea.set = async () => { throw new Error('QUOTA_BYTES quota exceeded'); };
+        signalSaved();
+        return {ok: true, verified: true, recordId: 'confirmed-in-bars'};
+    }}});
+    const originalSet = app.sessionArea.set;
+    await app.send('connect');
+    const rows = [validRow()];
+    await app.send('draft', {draft: {rows}});
+    assert.equal((await app.send('start', {rows})).ok, true);
+    await didSave;
+    await pause(30);
+    assert.equal(app.session['cardSessionV1:1'].run.phase, 'saving');
+    app.sessionArea.set = originalSet;
+    const recovered = await app.send('status');
+    assert.equal(recovered.state.run.status, 'uncertain');
+    assert.equal((await app.send('start', {rows})).ok, false);
+    assert.equal(app.calls.filter(action => action === 'save').length, 1);
 });

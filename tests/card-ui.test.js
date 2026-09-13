@@ -3,7 +3,7 @@ const {test}=require('node:test'),assert=require('node:assert/strict'),fs=requir
 const {JSDOM}=require('jsdom');
 const C=require('../diary-core');
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-async function setup({state,library,settings={},failConnect=false,otherState,statusGate,continueResult,random}={}){
+async function setup({state,library,settings={},failConnect=false,otherState,statusGate,continueResult,draftResult,random}={}){
     const dom=new JSDOM(fs.readFileSync(path.join(__dirname,'../diaries.html'),'utf8'),{url:'https://extension.invalid/diaries.html?tab=1',runScripts:'outside-only'});
     const win=dom.window;
     if(random)win.Math.random=random;
@@ -21,7 +21,11 @@ async function setup({state,library,settings={},failConnect=false,otherState,sta
         calls.push(message);
         if(message.action==='load'){if(message.tabId===2&&otherState)current=otherState;return {ok:true,state:current,library:lib,settings};}
         if(message.action==='connect'&&failConnect)return {ok:false,error:'Карточка закрыта'};
-        if(message.action==='draft'){current={...current,draft:JSON.parse(JSON.stringify(message.draft))};return {ok:true,state:current};}
+        if(message.action==='draft'){
+            const result=draftResult?await draftResult(message,current):null;
+            if(result&&!result.ok)return result;
+            current={...current,draft:JSON.parse(JSON.stringify(message.draft))};return result||{ok:true,state:current};
+        }
         if(message.action==='status'){const snapshot=JSON.parse(JSON.stringify(current));if(statusGate)await statusGate;return {ok:true,state:snapshot};}
         if(message.action==='continue'&&continueResult){const result=await continueResult(message,current);if(result.state)current=result.state;return result;}
         if(message.action==='saveLibrary'){lib=C.cleanLibrary(message.library);return {ok:true,library:lib};}
@@ -159,6 +163,78 @@ test('запоздалый статус прежней вкладки не по�
     const app=await setup({state,otherState,statusGate});const pending=app.poll();
     await app.source(2);release();await pending;
     assert.equal(app.$('patientName').textContent,'Второй');assert.equal(app.$('diary').value,'');app.dom.window.close();
+});
+
+test('опрос статуса не подменяет ещё не сохранённый текст устаревшим черновиком',async()=>{
+    let release;const statusGate=new Promise(resolve=>{release=resolve;});
+    const oldRow={...C.createRow({date:'2026-09-01',time:'08:00'}),diary:'Старая сохранённая версия'};
+    const state={patient:{key:'test',fullName:'Учебный пациент'},draft:{rows:[oldRow],defaults:{...C.DEFAULTS},hourStep:4,profileId:''},run:{id:'run',status:'done',updatedAt:1,rows:[oldRow],results:[]}};
+    const app=await setup({state,statusGate});
+    try{
+        state.run={...state.run,updatedAt:2};
+        const pending=app.poll();
+        app.input('diary','Новый ещё не сохранённый текст');
+        release();await pending;
+        assert.equal(app.$('diary').value,'Новый ещё не сохранённый текст');
+        await pause(380);
+        assert.equal(app.state.draft.rows[0].diary,'Новый ещё не сохранённый текст');
+    }finally{release();app.dom.window.close();}
+});
+
+test('обновление статуса сохраняет выбранную запись, если она есть в свежем черновике',async()=>{
+    const rows=['Первая запись','Вторая запись'].map((diary,index)=>({...C.createRow({date:'2026-09-01',time:index?'12:00':'08:00'}),diary}));
+    const state={patient:{key:'test',fullName:'Учебный пациент'},draft:{rows,defaults:{...C.DEFAULTS},hourStep:4,profileId:''},run:{id:'run',status:'running',updatedAt:1,rows,results:[]}};
+    const app=await setup({state});
+    try{
+        app.$('rowList').children[1].click();
+        state.run={...state.run,updatedAt:2};
+        await app.poll();
+        assert.equal(app.$('diary').value,'Вторая запись');
+        assert.equal(app.$('rowList').children[1].getAttribute('aria-current'),'true');
+    }finally{app.dom.window.close();}
+});
+
+test('ошибка сохранения остаётся видимой до успешной повторной записи исправленного текста',async()=>{
+    let attempts=0;
+    const app=await setup({draftResult:async()=>++attempts===2?{ok:false,error:'Черновик превышает доступный объём памяти браузера.'}:null});
+    try{
+        app.input('diary','Слишком большой учебный текст');await pause(380);
+        assert(app.$('message').textContent.includes('Черновик превышает доступный объём'));
+        const failedWriteEvent=new app.win.Event('beforeunload',{cancelable:true});
+        assert.equal(app.win.dispatchEvent(failedWriteEvent),false);
+        app.$('anotherVitals').click();
+        assert(app.$('message').textContent.includes('Черновик превышает доступный объём'));
+        app.input('diary','Исправленный короткий текст');await pause(380);
+        assert(!app.$('message').textContent.includes('Черновик превышает доступный объём'));
+        assert.equal(app.state.draft.rows[0].diary,'Исправленный короткий текст');
+    }finally{app.dom.window.close();}
+});
+
+test('отправка в БАРС не начинается, если актуальный черновик сохранить не удалось',async()=>{
+    let attempts=0;
+    const app=await setup({draftResult:async()=>++attempts===2?{ok:false,error:'Черновик превышает доступный объём памяти браузера.'}:null});
+    try{
+        app.input('diary','Проверенный учебный текст');app.$('reviewed').click();
+        app.$('sendAll').click();await pause(30);
+        assert.equal(app.calls.some(call=>call.action==='start'),false);
+        assert(app.$('message').textContent.includes('Черновик превышает доступный объём'));
+        app.input('diary','Исправленный текст');await pause(380);
+        assert(!app.$('message').textContent.includes('Черновик превышает доступный объём'));
+    }finally{app.dom.window.close();}
+});
+
+test('закрытие предупреждает только пока изменённый черновик не сохранён',async()=>{
+    const app=await setup();
+    try{
+        app.input('diary','Текст перед закрытием');
+        const dirtyEvent=new app.win.Event('beforeunload',{cancelable:true});
+        assert.equal(app.win.dispatchEvent(dirtyEvent),false);
+        assert.equal(dirtyEvent.defaultPrevented,true);
+        await pause(30);
+        const savedEvent=new app.win.Event('beforeunload',{cancelable:true});
+        assert.equal(app.win.dispatchEvent(savedEvent),true);
+        assert.equal(savedEvent.defaultPrevented,false);
+    }finally{app.dom.window.close();}
 });
 
 test('экспорт журнала содержит этапы, но исключает пациента и тексты очереди',async()=>{

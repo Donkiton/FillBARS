@@ -5,13 +5,108 @@
     const LIBRARY = 'cardLibraryV1';
     const SETTINGS = 'cardSettingsV1';
     const ACTIVE = 'cardActiveContextV1';
+    const SESSION_FALLBACK_QUOTA_BYTES = 1024 * 1024;
+    const LOCAL_FALLBACK_QUOTA_BYTES = 5 * 1024 * 1024;
+    const MAX_TRACE_ENTRIES = 250;
+    const MAX_TRACE_ENTRY_BYTES = 1024;
+    // Trace is capped below 1 KiB before storage; the reserve includes encoding and
+    // storage overhead. A receipt can duplicate a bounded Unicode record ID in both
+    // the result and its draft row, so it receives a larger independent reserve.
+    const TRACE_ENTRY_RESERVE_BYTES = 1536;
+    const RECEIPT_RESERVE_BYTES = 4 * 1024;
     const running = new Map();
     let operations = Promise.resolve();
     const key = tabId => 'cardSessionV1:' + tabId;
     const load = async tabId => (await chrome.storage.session.get(key(tabId)))[key(tabId)] || null;
-    const store = async (tabId, state) => { await chrome.storage.session.set({ [key(tabId)]: state }); return state; };
+    class StorageQuotaError extends Error {
+        constructor(area = 'session') {
+            super(area === 'local'
+                ? 'Библиотека слишком велика для локального хранилища расширения. Сократите шаблоны или удалите лишние варианты.'
+                : area === 'settings'
+                    ? 'Недостаточно места в локальном хранилище настроек расширения.'
+                    : 'Недостаточно места во временном хранилище дневников. Сократите текст или удалите неотправленные строки. Уже сохранённые записи и текущая очередь не изменены.');
+            this.code = 'storage_quota';
+        }
+    }
+    const utf8Length = value => {
+        const text = typeof value === 'string' ? value : JSON.stringify(value);
+        if (typeof globalThis.TextEncoder === 'function') return new globalThis.TextEncoder().encode(text || '').byteLength;
+        // Node VM fixtures and very old test harnesses may not expose TextEncoder.
+        // This is only a conservative preflight estimate; Chrome itself supplies TextEncoder.
+        try { return unescape(encodeURIComponent(text || '')).length; }
+        catch (_) { return (text || '').length * 3; }
+    };
+    // getBytesInUse is authoritative for existing storage. The estimate below deliberately
+    // has headroom: JSON character count is neither a byte count nor Chrome's memory model.
+    const estimatedEntryBytes = (name, value) => {
+        const payload = utf8Length(value);
+        return utf8Length(name) + Math.ceil(payload * 1.2) + 128;
+    };
+    const storageQuota = (area, fallback) => Number.isFinite(area?.QUOTA_BYTES) && area.QUOTA_BYTES > 0 ? area.QUOTA_BYTES : fallback;
+    async function bytesInUse(area, keys) {
+        if (typeof area?.getBytesInUse !== 'function') return null;
+        const value = await area.getBytesInUse(keys);
+        return Number.isFinite(value) && value >= 0 ? value : null;
+    }
+    function quotaHeadroom(quota) {
+        return Math.min(quota <= SESSION_FALLBACK_QUOTA_BYTES ? 128 * 1024 : 512 * 1024, Math.floor(quota * 0.15));
+    }
+    async function assertStorageWriteFits(area, entries, { fallbackQuota, reserve = 0, kind = 'session' } = {}) {
+        const quota = storageQuota(area, fallbackQuota);
+        const total = await bytesInUse(area, null);
+        const replaced = await bytesInUse(area, Object.keys(entries));
+        if (total === null || replaced === null) return;
+        const next = total - replaced + Object.entries(entries).reduce((sum, [name, value]) => sum + estimatedEntryBytes(name, value), 0);
+        if (next + reserve + quotaHeadroom(quota) > quota) throw new StorageQuotaError(kind);
+    }
+    async function setStorage(area, entries, options) {
+        await assertStorageWriteFits(area, entries, options);
+        try { await area.set(entries); }
+        catch (error) {
+            if (/quota|QUOTA_BYTES/i.test(String(error?.message || error))) throw new StorageQuotaError(options?.kind);
+            throw error;
+        }
+    }
+    const store = async (tabId, state) => { await setStorage(chrome.storage.session, { [key(tabId)]: state }, { fallbackQuota: SESSION_FALLBACK_QUOTA_BYTES, kind: 'session' }); return state; };
     const activeContext = async () => (await chrome.storage.session.get(ACTIVE))[ACTIVE] || null;
     const protectedRun = state => ['running', 'uncertain', 'interrupted'].includes(state?.run?.status);
+    const boundedText = (value, max) => String(value ?? '').slice(0, max);
+    function boundedTraceValue(value, depth = 0) {
+        if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+        if (typeof value === 'string') return boundedText(value, 240);
+        if (depth >= 2 || typeof value !== 'object') return boundedText(value, 240);
+        if (Array.isArray(value)) return value.slice(0, 8).map(item => boundedTraceValue(item, depth + 1));
+        return Object.fromEntries(Object.entries(value).slice(0, 12).map(([name, item]) => [boundedText(name, 64), boundedTraceValue(item, depth + 1)]));
+    }
+    function compactTrace(entry, row) {
+        const source = entry && typeof entry === 'object' ? entry : {};
+        const compact = { time: boundedText(source.time || new Date().toISOString(), 64), row, stage: boundedText(source.stage || 'Техническое сообщение', 320) };
+        for (const [name, value] of Object.entries(source).slice(0, 12)) {
+            if (!['time', 'row', 'stage'].includes(name)) compact[boundedText(name, 64)] = boundedTraceValue(value);
+        }
+        return utf8Length(compact) <= MAX_TRACE_ENTRY_BYTES ? compact : { time: compact.time, row, stage: compact.stage, detail: 'Подробности сокращены из-за лимита хранилища.' };
+    }
+    function runReserve(state) {
+        const run = state?.run;
+        if (!run) return 0;
+        const receiptCount = Math.max(0, (run.rows?.length || 0) - (run.results?.length || 0));
+        const traceCount = Math.max(0, MAX_TRACE_ENTRIES - (run.trace?.length || 0));
+        return receiptCount * RECEIPT_RESERVE_BYTES + traceCount * TRACE_ENTRY_RESERVE_BYTES;
+    }
+    function runProjection(state, rows, fillOnly = false) {
+        const projected = Core.clone(state);
+        projected.run = { id: 'reserve', status: 'running', phase: 'starting', index: 0, rows: Core.clone(rows), fillOnly: !!fillOnly, results: [], trace: [], updatedAt: Date.now(), message: 'Резерв места для очереди' };
+        return projected;
+    }
+    async function assertRunFits(tabId, state, rows, fillOnly = false) {
+        const projected = runProjection(state, rows, fillOnly);
+        await assertStorageWriteFits(chrome.storage.session, { [key(tabId)]: projected }, { fallbackQuota: SESSION_FALLBACK_QUOTA_BYTES, reserve: runReserve(projected), kind: 'session' });
+    }
+    function assertRowIds(rows) {
+        if (rows.some(row => typeof row?.id !== 'string' || !row.id || utf8Length(row.id) > 160)) {
+            throw new Error('У записи повреждён служебный идентификатор. Удалите её и создайте заново; сохранение в БАРС не выполнялось.');
+        }
+    }
     async function assertContext(tabId, message) {
         const active = await activeContext();
         const state = await load(tabId);
@@ -56,7 +151,9 @@
             patient: frame.result.patient, connectedAt: new Date().toISOString(),
             draft: samePatient ? existing?.draft || null : null, run: samePatient ? existing?.run || null : null
         };
-        await chrome.storage.session.set({ [key(tabId)]: state, [ACTIVE]: { tabId, contextId: state.contextId } });
+        // Do not remove the previous tab before this write. A rejected transient double
+        // allocation must leave its draft and any receipts intact for recovery.
+        await setStorage(chrome.storage.session, { [key(tabId)]: state, [ACTIVE]: { tabId, contextId: state.contextId } }, { fallbackQuota: SESSION_FALLBACK_QUOTA_BYTES, kind: 'session' });
         if (active && active.tabId !== tabId) await chrome.storage.session.remove(key(active.tabId));
         return { ...state, probe: frame.result };
     }
@@ -72,16 +169,20 @@
     function recordSaved(state, row, receipt) {
         const run = state.run;
         run.results ||= [];
-        if (!run.results.some(item => item.rowId === row.id)) run.results.push({ rowId: row.id, ...receipt });
+        if (!run.results.some(item => item.rowId === row.id)) run.results.push({
+            rowId: row.id,
+            recordId: boundedText(receipt?.recordId, 256),
+            verification: boundedText(receipt?.verification || '', 64)
+        });
         const draftRow = state.draft?.rows?.find(item => item.id === row.id);
-        if (draftRow) Object.assign(draftRow, { status: 'saved', recordId: receipt.recordId });
+        if (draftRow) Object.assign(draftRow, { status: 'saved', recordId: boundedText(receipt?.recordId, 256) });
     }
     async function runQueue(tabId, state, fillOnly) {
         const control = running.get(tabId);
         const run = state.run;
         const appendTrace = result => {
             if (!Array.isArray(result?.trace)) return;
-            run.trace = [...(run.trace || []), ...result.trace.map(entry => ({ ...entry, row: run.index + 1 }))].slice(-250);
+            run.trace = [...(run.trace || []), ...result.trace.map(entry => compactTrace(entry, run.index + 1))].slice(-MAX_TRACE_ENTRIES);
         };
         const checkpoint = async (phase, message) => {
             run.phase = phase; run.message = message; run.updatedAt = Date.now();
@@ -109,6 +210,7 @@
                     return;
                 }
                 // Persist the saving checkpoint before any request can create a record.
+                await assertStorageWriteFits(chrome.storage.session, { [key(tabId)]: state }, { fallbackQuota: SESSION_FALLBACK_QUOTA_BYTES, reserve: runReserve(state), kind: 'session' });
                 await checkpoint('saving', 'Сохранение и проверка дневника ' + (index + 1));
                 const saved = await callPage(state.binding, 'save', args);
                 appendTrace(saved);
@@ -123,8 +225,14 @@
             run.status = 'done';
             await checkpoint('done', 'Сохранение всех дневников подтверждено.');
         } catch (error) {
-            run.status = run.phase === 'saving' ? 'uncertain' : 'interrupted';
-            await checkpoint(run.phase, publicError()).catch(() => undefined);
+            const uncertain = run.phase === 'saving';
+            run.status = uncertain ? 'uncertain' : 'interrupted';
+            // A storage failure after a save checkpoint must leave that checkpoint in place.
+            // It is safer to recover as uncertain than to risk a second clinical save.
+            const storageMessage = uncertain
+                ? 'Временное хранилище заполнилось во время сохранения. Состояние очереди оставлено неопределённым: проверьте текущую запись в БАРС, повторная отправка не выполнена.'
+                : 'Недостаточно места во временном хранилище дневников. Отправка в БАРС не начата; черновики сохранены.';
+            await checkpoint(run.phase, error instanceof StorageQuotaError ? storageMessage : publicError()).catch(() => undefined);
         } finally { running.delete(tabId); }
     }
     async function start(tabId, message) {
@@ -135,9 +243,13 @@
         const rows = Core.clone(message.rows || []);
         const errors = Core.validateQueue(rows, { forSending: true });
         if (errors.length) throw new Error('Запись ' + (errors[0].index + 1) + ': ' + errors[0].message);
+        assertRowIds(rows);
         if (message.fillOnly && rows.length !== 1) throw new Error('Для заполнения без сохранения выберите одну запись.');
         const savedIds = new Set((state.draft?.rows || []).filter(row => row.status === 'saved').map(row => row.id));
         if (rows.some(row => savedIds.has(row.id))) throw new Error('В очереди есть уже сохранённая запись.');
+        // Reserve before probing/preparing BARS: rows are kept twice, and every future
+        // receipt plus bounded technical trace must fit through the end of the queue.
+        await assertRunFits(tabId, state, rows, !!message.fillOnly);
         const probe = await callPage(state.binding, 'probe');
         if (!probe.ok || probe.patient.key !== state.patient.key) throw new Error(probe.message || 'Пациент изменился. Нажмите «Дневники» из нужной карточки.');
         if (['failed', 'stopped', 'filled'].includes(state.run?.status)) {
@@ -163,8 +275,9 @@
         if (!probe.ok || probe.patient?.key !== state.patient.key) throw new Error(probe.message || 'Откройте в БАРС пациента этой очереди.');
         run.results ||= [];
         if (confirmSave) {
+            await assertStorageWriteFits(chrome.storage.session, { [key(tabId)]: state }, { fallbackQuota: SESSION_FALLBACK_QUOTA_BYTES, reserve: runReserve(state), kind: 'session' });
             recordSaved(state, current, { verification: 'manual' });
-            run.trace = [...(run.trace || []), { time: new Date().toISOString(), row: (run.index || 0) + 1, stage: 'Пользователь подтвердил сохранение в БАРС' }].slice(-250);
+            run.trace = [...(run.trace || []), compactTrace({ time: new Date().toISOString(), stage: 'Пользователь подтвердил сохранение в БАРС' }, (run.index || 0) + 1)].slice(-MAX_TRACE_ENTRIES);
             // Commit the receipt BEFORE releasing the page or starting the next row.
             // If the worker stops here, continuation skips this diary.
             run.releaseChecked = true;
@@ -207,12 +320,12 @@
         if (message.action === 'connect') return { state: await connect(tabId) };
         if (message.action === 'saveSettings') {
             const settings = Core.cleanSettings(message.settings);
-            await chrome.storage.local.set({ [SETTINGS]: settings });
+            await setStorage(chrome.storage.local, { [SETTINGS]: settings }, { fallbackQuota: LOCAL_FALLBACK_QUOTA_BYTES, kind: 'settings' });
             return { settings };
         }
         if (message.action === 'saveLibrary') {
             const library = Core.cleanLibrary(message.library);
-            await chrome.storage.local.set({ [LIBRARY]: library });
+            await setStorage(chrome.storage.local, { [LIBRARY]: library }, { fallbackQuota: LOCAL_FALLBACK_QUOTA_BYTES, kind: 'local' });
             return { library };
         }
         if (message.action === 'draft') {
@@ -220,10 +333,15 @@
             const state = await recover(tabId) || { binding: null, patient: null, run: null };
             if (['uncertain', 'interrupted'].includes(state.run?.status)) throw new Error('Сначала завершите разбор предыдущей отправки.');
             const draft = message.draft;
-            if (!draft || !Array.isArray(draft.rows) || draft.rows.length > Core.MAX_ROWS || JSON.stringify(draft).length > 1500000) throw new Error('Черновик слишком большой.');
+            if (!draft || !Array.isArray(draft.rows) || draft.rows.length > Core.MAX_ROWS) throw new Error('Черновик слишком большой.');
+            assertRowIds(draft.rows);
             // UI edits cannot clear receipt flags and accidentally re-send a saved row.
             const receipts = new Map((state.draft?.rows || []).filter(r => r.status === 'saved').map(r => [r.id, r]));
             for (const row of draft.rows) if (receipts.has(row.id)) Object.assign(row, { status: 'saved', recordId: receipts.get(row.id).recordId });
+            const nextState = { ...state, draft };
+            // A draft is accepted only when it can later hold a duplicated run, receipts
+            // and trace. Failed writes leave the stored draft exactly as it was.
+            await assertRunFits(tabId, nextState, draft.rows, false);
             state.draft = draft; await store(tabId, state); return { state };
         }
         if (message.action === 'start') return { state: await start(tabId, message) };
@@ -255,7 +373,7 @@
         }
         const current = operations.catch(() => undefined).then(() => handle(message));
         operations = current;
-        current.then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message || publicError() }));
+        current.then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message || publicError(), ...(error?.code ? { code: error.code } : {}) }));
         return true;
     });
     chrome.tabs.onRemoved.addListener(tabId => {

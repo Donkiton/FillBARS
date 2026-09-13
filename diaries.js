@@ -20,6 +20,13 @@
     let selected = draft.rows[0].id;
     let saveTimer;
     let saveChain = Promise.resolve();
+    let draftRevision = 0;
+    let savedDraftRevision = 0;
+    let pendingDraftSaves = 0;
+    let draftSaveError = '';
+    let draftSaveErrorRevision = -1;
+    let currentMessage = '';
+    let currentMessageIsError = false;
     let busy = false;
     let polling = false;
     let editLibrary = null;
@@ -38,21 +45,66 @@
     const unresolved = () => ['uncertain', 'interrupted'].includes(state?.run?.status);
     const locked = () => busy || running() || unresolved();
     const textGender = () => ['male', 'female'].includes(draft.gender) ? draft.gender : C.inferGender(state?.patient?.fullName);
+    function renderMessage() {
+        const parts = [draftSaveError, currentMessage].filter(Boolean);
+        $('message').hidden = !parts.length;
+        $('message').textContent = parts.join('\n');
+        $('message').classList.toggle('errors', !!draftSaveError || currentMessageIsError);
+    }
     function message(text, error = false) {
-        $('message').hidden = !text;
-        $('message').textContent = text;
-        $('message').classList.toggle('errors', error);
+        if (error && draftSaveError && draftSaveError.endsWith(text)) {
+            renderMessage();
+            return;
+        }
+        currentMessage = text;
+        currentMessageIsError = error;
+        renderMessage();
+    }
+    function reportDraftSaveError(error, revision) {
+        draftSaveError = 'Не удалось сохранить черновик: ' + error.message;
+        draftSaveErrorRevision = revision;
+        renderMessage();
+    }
+    function hasUnsavedDraft() {
+        return draftRevision > savedDraftRevision || pendingDraftSaves > 0 || !!saveTimer || !!draftSaveError;
+    }
+    function acceptRemoteDraft(incomingDraft, { resetSelection = false } = {}) {
+        const nextDraft = incomingDraft?.rows?.length ? incomingDraft : newDraft();
+        const keepSelection = !resetSelection && nextDraft.rows.some(item => item.id === selected);
+        draft = nextDraft;
+        if (!keepSelection) selected = draft.rows[0].id;
+        draftRevision = 0;
+        savedDraftRevision = 0;
+        draftSaveError = '';
+        draftSaveErrorRevision = -1;
+        renderMessage();
     }
     function saveDraft() {
         clearTimeout(saveTimer);
+        saveTimer = undefined;
         const copy = C.clone(draft);
         const destination = { tabId, contextId: state?.contextId };
-        saveChain = saveChain.catch(() => undefined).then(() => request('draft', { draft: copy, ...destination }));
-        return saveChain;
+        const revision = draftRevision;
+        pendingDraftSaves++;
+        const operation = saveChain.catch(() => undefined).then(() => request('draft', { draft: copy, ...destination }));
+        saveChain = operation;
+        return operation.then(response => {
+            savedDraftRevision = Math.max(savedDraftRevision, revision);
+            if (revision >= draftSaveErrorRevision) {
+                draftSaveError = '';
+                draftSaveErrorRevision = -1;
+                renderMessage();
+            }
+            return response;
+        }, error => {
+            reportDraftSaveError(error, revision);
+            throw error;
+        }).finally(() => { pendingDraftSaves--; });
     }
     function scheduleSave() {
         clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => saveDraft().catch(error => message('Не удалось сохранить черновик: ' + error.message, true)), 350);
+        draftRevision++;
+        saveTimer = setTimeout(() => saveDraft().catch(() => undefined), 350);
     }
     function resetErrors() {
         $('errors').hidden = true;
@@ -298,8 +350,7 @@
             state = response.state;
             connected = !!state?.patient;
             lastRunVersion = state?.run?.id + ':' + state?.run?.updatedAt + ':' + state?.run?.status;
-            if (state.draft) draft = state.draft;
-            else { draft = newDraft(); selected = draft.rows[0].id; }
+            acceptRemoteDraft(state.draft, { resetSelection: true });
             await saveDraft();
         } catch (error) { message(error.message, true); }
         finally { busy = false; render(); }
@@ -321,8 +372,7 @@
                 history.replaceState(null, '', '?tab=' + tabId);
                 state = loaded.state; library = C.cleanLibrary(loaded.library); settings = C.cleanSettings(loaded.settings); connected = false;
                 lastRunVersion = state?.run?.id + ':' + state?.run?.updatedAt + ':' + state?.run?.status;
-                draft = state?.draft?.rows?.length ? state.draft : newDraft();
-                selected = draft.rows[0].id;
+                acceptRemoteDraft(state?.draft, { resetSelection: true });
             } finally { busy = false; render(); }
         }
         await connect();
@@ -375,7 +425,7 @@
         try {
             await saveChain.catch(() => undefined);
             await request('clear', { checkedInBars });
-            state = null; draft = newDraft(); selected = draft.rows[0].id;
+            state = null; acceptRemoteDraft(null, { resetSelection: true });
             connected = false; cleared = true; resetErrors(); message('');
         } catch (error) { message(error.message, true); }
         finally { busy = false; render(); }
@@ -393,7 +443,7 @@
         try {
             const response = await request('continue', { runId: run.id, rowId: current.id, checkedInBars: run.phase === 'saving' });
             state = response.state;
-            if (state.draft) draft = state.draft;
+            if (state.draft) acceptRemoteDraft(state.draft);
             connected = !!state.patient;
             lastRunVersion = ''; $('stop').disabled = false; message('');
         } catch (error) { message(error.message, true); }
@@ -558,6 +608,9 @@
         if (polling || busy) return;
         polling = true;
         const requestedTabId = tabId, requestedRevision = contextRevision;
+        const requestedDraftRevision = draftRevision;
+        const requestedSavedRevision = savedDraftRevision;
+        const hadUnsavedDraft = hasUnsavedDraft();
         try {
             const response = await request('status');
             if (busy || requestedTabId !== tabId || requestedRevision !== contextRevision) return;
@@ -565,14 +618,18 @@
             const version = incoming?.run?.id + ':' + incoming?.run?.updatedAt + ':' + incoming?.run?.status;
             if (incoming?.run && version !== lastRunVersion) {
                 state = incoming; lastRunVersion = version;
-                if (incoming.draft) draft = incoming.draft;
+                const localDraftStayedStable = requestedDraftRevision === draftRevision && requestedSavedRevision === savedDraftRevision;
+                if (incoming.draft && !hadUnsavedDraft && localDraftStayedStable && !hasUnsavedDraft()) acceptRemoteDraft(incoming.draft);
                 $('stop').disabled = false; render();
             }
         } catch (error) { if (running()) message(error.message, true); }
         finally { polling = false; }
     }
-    window.addEventListener('beforeunload', () => {
-        if (saveTimer && !locked()) { clearTimeout(saveTimer); void saveDraft(); }
+    window.addEventListener('beforeunload', event => {
+        if (!hasUnsavedDraft()) return;
+        if (saveTimer && !locked()) void saveDraft().catch(() => undefined);
+        event.preventDefault();
+        event.returnValue = '';
     });
     try {
         if (!window.cardPreviewRequest && window.chrome?.windows?.getCurrent) {
@@ -585,9 +642,7 @@
         const loaded = await request('load');
         library = C.cleanLibrary(loaded.library); state = loaded.state; settings = C.cleanSettings(loaded.settings);
         lastRunVersion = state?.run?.id + ':' + state?.run?.updatedAt + ':' + state?.run?.status;
-        if (state?.draft?.rows?.length) draft = state.draft;
-        else draft = newDraft();
-        selected = draft.rows[0].id;
+        acceptRemoteDraft(state?.draft, { resetSelection: true });
         render();
         await connect();
         if (window.cardPreviewRequest) message('Предпросмотр интерфейса. Учебные данные, соединения с МИС нет.');
